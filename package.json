@@ -1,0 +1,42 @@
+{
+  "name": "aws-audit-scanner",
+  "version": "0.1.0",
+  "description": "Open-source AWS account scanner for common cost and security problems. Read-only, runs locally, covers every region.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whatsinmycloud/aws-audit-scanner.git"
+  },
+  "keywords": [
+    "aws", "audit", "security", "cost", "mcp", "model-context-protocol",
+    "read-only", "s3", "iam", "ec2", "cloudtrail"
+  ],
+  "bin": { "aws-audit-scanner": "./dist/index.js" },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudtrail": "^3.1075.0",
+    "@aws-sdk/client-ec2": "^3.0.0",
+    "@aws-sdk/client-iam": "^3.0.0",
+    "@aws-sdk/client-rds": "^3.1086.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-sts": "^3.1079.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.9"
+  }
+}
