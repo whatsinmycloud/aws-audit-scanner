@@ -126,16 +126,21 @@ If you're evaluating whether to point this at an account you care about: read
 ## Coverage, honestly
 
 - **Pagination is handled.** Every list call follows its continuation token.
-  Worth stating because it wasn't always true here: IAM's `ListUsers` returns
-  100 items when you don't pass `MaxItems`, so an unpaginated scan of a
-  150-user account reported "2 users without MFA" with complete confidence
-  while never looking at the other 50. A wrong number in a security report is
+  Worth stating because it wasn't always true here: IAM's `ListUsers` defaults
+  `MaxItems` to 100 when you omit it, and the docs warn it may return fewer
+  even when more exist — so the count is never an end-of-list signal. An
+  unpaginated scan of a 150-user account reported two users without an MFA
+  device with complete confidence, while never looking at the other 50. A wrong number in a security report is
   worse than a missing one, because nothing signals that it's wrong. The EC2
   calls are paginated defensively rather than because a bug was demonstrated —
   `DescribeSecurityGroups` documents that omitting `MaxResults` returns
   everything. `src/paginate.ts` has the mechanics, and
   `src/tools/ugly-account.test.ts` fails the build if a first-page-only
-  regression ever creeps back in.
+  regression ever creeps back in. The paginator **fails closed**: if a
+  continuation token repeats, or a response says it is truncated but carries no
+  marker, it throws rather than returning what it has. Each scan turns that
+  into an explicit failure for that check, so a partial list can never be
+  mistaken for a complete one.
 - **Region discovery is a presence probe.** `discover.ts` checks every enabled
   region cheaply and deep-scans the ones with resources. `region-sweep.ts`
   deliberately reads only the first page — it answers "is there anything here?",

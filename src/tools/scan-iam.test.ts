@@ -7,12 +7,19 @@ import {
   ListAccessKeysCommand,
   GetAccessKeyLastUsedCommand,
   ListMFADevicesCommand,
+  GetLoginProfileCommand,
 } from '@aws-sdk/client-iam';
 import { scanIam } from './scan-iam.js';
 
 const iamMock = mockClient(IAMClient);
 
 const HEALTHY_SUMMARY = { SummaryMap: { AccountAccessKeysPresent: 0, AccountMFAEnabled: 1 } };
+// GetLoginProfile answers "can this user sign in to the console": a profile
+// means yes, NoSuchEntity means no, and a denial (an audit role deployed
+// before iam:GetLoginProfile was granted) means we must not guess.
+const noSuchEntity = Object.assign(new Error('no login profile'), { name: 'NoSuchEntityException' });
+const accessDenied = Object.assign(new Error('not authorized'), { name: 'AccessDenied' });
+
 const MFA_DEVICE = { MFADevices: [{ UserName: 'stephen', SerialNumber: 'arn:mfa', EnableDate: new Date() }] };
 
 function daysAgo(days: number): Date {
@@ -107,23 +114,52 @@ describe('scanIam', () => {
     expect(result.findings[0]?.title).toContain('1100 days old');
   });
 
-  it('never claims a user without MFA can sign in with a password', async () => {
-    // ListMFADevices says no device is registered. It says nothing about
-    // whether the user has a console password, so a programmatic-only service
-    // account must not be described as able to sign in.
+  function userWithoutMfa(name: string) {
     iamMock.on(GetAccountSummaryCommand).resolves(HEALTHY_SUMMARY);
-    iamMock.on(ListUsersCommand).resolves({ Users: [{ UserName: 'ci-deploy', Path: '/', UserId: 'u2', Arn: 'arn:u2', CreateDate: daysAgo(30) }] });
+    iamMock.on(ListUsersCommand).resolves({ Users: [{ UserName: name, Path: '/', UserId: 'u2', Arn: 'arn:u2', CreateDate: daysAgo(30) }] });
     iamMock.on(ListAccessKeysCommand).resolves({ AccessKeyMetadata: [] });
     iamMock.on(ListMFADevicesCommand).resolves({ MFADevices: [] });
+  }
+
+  // The false positive this replaced: every programmatic-only service account
+  // was told it "can sign in with just a password", which it cannot.
+  it('raises nothing for a user with no console password', async () => {
+    userWithoutMfa('ci-deploy');
+    iamMock.on(GetLoginProfileCommand).rejects(noSuchEntity);
 
     const result = await scanIam({ region: 'eu-west-1' });
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    const mfa = result.findings.find((f) => f.title.includes('no MFA device'));
-    expect(mfa).toBeDefined();
+    expect(result.findings.filter((f) => f.title.includes('MFA device'))).toHaveLength(0);
+  });
+
+  it('raises MEDIUM and says so plainly when the user does have console access', async () => {
+    userWithoutMfa('stephen');
+    iamMock.on(GetLoginProfileCommand).resolves({});
+
+    const result = await scanIam({ region: 'eu-west-1' });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const mfa = result.findings.find((f) => f.title.includes('MFA device'));
+    expect(mfa?.severity).toBe('MEDIUM');
+    expect(mfa?.title).toContain('has console access and no MFA device');
+  });
+
+  it('downgrades to LOW and admits the gap when the permission is missing', async () => {
+    userWithoutMfa('stephen');
+    iamMock.on(GetLoginProfileCommand).rejects(accessDenied);
+
+    const result = await scanIam({ region: 'eu-west-1' });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const mfa = result.findings.find((f) => f.title.includes('MFA device'));
+    expect(mfa?.severity).toBe('LOW');
+    expect(mfa?.title).toContain('console access unknown');
+    expect(mfa?.description).toContain('iam:GetLoginProfile');
     expect(mfa?.description).not.toContain('can sign in with just a password');
-    expect(mfa?.description).toContain('If this user can sign in');
   });
 
   it('flags an old never-used access key as HIGH', async () => {
