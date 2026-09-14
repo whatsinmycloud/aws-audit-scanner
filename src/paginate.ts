@@ -44,8 +44,15 @@ export async function collectPages<TPage, TItem>({
   return collected;
 }
 
-// IAM and RDS signal "more pages" with IsTruncated alongside Marker. Trusting
-// Marker alone is wrong: these APIs can return a Marker on the final page.
+// IAM and RDS signal "more pages" with IsTruncated alongside Marker, and the
+// documented contract is the flag: "When IsTruncated is true, this element is
+// present and contains the value to use for the Marker parameter in a
+// subsequent pagination request." Reading the flag rather than the Marker's
+// presence follows that contract exactly, and costs nothing if a stale Marker
+// never actually appears. (An earlier comment here asserted that IAM *does*
+// return a Marker on the final page. Nothing in the docs says so and we have
+// no captured response showing it, so the claim is gone — a guard that is
+// merely correct does not need an invented justification.)
 export function markerToken(page: {
   IsTruncated?: boolean | undefined;
   Marker?: string | undefined;

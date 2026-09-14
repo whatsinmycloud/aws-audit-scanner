@@ -9,7 +9,18 @@ import {
 import type { Finding, ScanInput, ScanResult } from '../types.js';
 import { collectPages, markerToken } from '../paginate.js';
 
+// Two different questions that were previously conflated. Rotation age comes
+// from the key's CreateDate; inactivity comes from LastUsedDate. Reporting one
+// as the other produced a finding titled "not rotated in N days" where N was
+// days since last use — and, worse, missed the dangerous case entirely: a key
+// created three years ago and used yesterday has an inactivity of 1 day, so it
+// never fired at all.
 const ACCESS_KEY_MAX_AGE_DAYS = 90;
+const ACCESS_KEY_MAX_IDLE_DAYS = 90;
+
+function daysSince(date: Date): number {
+  return Math.floor((Date.now() - date.getTime()) / (1000 * 60 * 60 * 24));
+}
 
 // IAM is a global service — region param is accepted for consistency but not used in API calls.
 // IAM is a global service: an access key or MFA setting has no region. The
@@ -99,33 +110,60 @@ async function checkIamUsers(client: IAMClient, region: string, findings: Findin
         const lastUsed = lastUsedResponse.AccessKeyLastUsed?.LastUsedDate;
         const createdAt = key.CreateDate;
 
-        const referenceDate = lastUsed ?? createdAt;
-        if (!referenceDate) continue;
+        const idleDays = lastUsed ? daysSince(lastUsed) : undefined;
+        const ageDays = createdAt ? daysSince(createdAt) : undefined;
 
-        const ageDays = Math.floor((Date.now() - referenceDate.getTime()) / (1000 * 60 * 60 * 24));
-
-        if (ageDays > ACCESS_KEY_MAX_AGE_DAYS) {
-          const neverUsed = !lastUsed;
+        // One finding per key, most urgent first, so a key that is both old and
+        // idle doesn't produce two rows saying nearly the same thing.
+        if (createdAt && idleDays === undefined && ageDays !== undefined && ageDays > ACCESS_KEY_MAX_AGE_DAYS) {
           findings.push({
             service: 'IAM',
             resourceId: `${username}/${keyId}`,
             region,
-            severity: neverUsed ? 'HIGH' : 'MEDIUM',
-            title: neverUsed
-              ? `IAM access key never used: ${username} (${keyId})`
-              : `IAM access key not rotated in ${ageDays} days: ${username} (${keyId})`,
-            description: neverUsed
-              ? `User "${username}" has an active access key (${keyId}) that has never been used. ` +
-                `Unused keys are a security risk — if leaked, they give permanent access with no audit trail.`
-              : `User "${username}" has an active access key (${keyId}) that hasn't been used in ${ageDays} days. ` +
-                `Keys should be rotated every ${ACCESS_KEY_MAX_AGE_DAYS} days to limit exposure if compromised.`,
+            severity: 'HIGH',
+            title: `IAM access key never used: ${username} (${keyId})`,
+            description:
+              `User "${username}" has an active access key (${keyId}), created ${ageDays} days ago, ` +
+              `that has never been used. Unused keys are a security risk: if leaked, they give ` +
+              `permanent access with no audit trail.`,
             fixSteps: [
-              neverUsed
-                ? `Delete the key immediately: IAM → Users → ${username} → Security credentials → delete ${keyId}.`
-                : `Rotate the key: create a new key, update wherever it's used, then delete the old one.`,
+              `Delete the key: IAM → Users → ${username} → Security credentials → delete ${keyId}.`,
               `CLI: aws iam delete-access-key --user-name ${username} --access-key-id ${keyId}`,
             ],
-            estimatedFixMinutes: neverUsed ? 2 : 15,
+            estimatedFixMinutes: 2,
+          });
+        } else if (idleDays !== undefined && idleDays > ACCESS_KEY_MAX_IDLE_DAYS) {
+          findings.push({
+            service: 'IAM',
+            resourceId: `${username}/${keyId}`,
+            region,
+            severity: 'MEDIUM',
+            title: `IAM access key unused for ${idleDays} days: ${username} (${keyId})`,
+            description:
+              `User "${username}" has an active access key (${keyId}) that hasn't been used in ` +
+              `${idleDays} days. A key nobody uses is a way in that nobody is watching.`,
+            fixSteps: [
+              `Confirm nothing still depends on it, then delete: IAM → Users → ${username} → Security credentials.`,
+              `CLI: aws iam delete-access-key --user-name ${username} --access-key-id ${keyId}`,
+            ],
+            estimatedFixMinutes: 10,
+          });
+        } else if (ageDays !== undefined && ageDays > ACCESS_KEY_MAX_AGE_DAYS) {
+          findings.push({
+            service: 'IAM',
+            resourceId: `${username}/${keyId}`,
+            region,
+            severity: 'MEDIUM',
+            title: `IAM access key is ${ageDays} days old: ${username} (${keyId})`,
+            description:
+              `User "${username}" has an active access key (${keyId}) created ${ageDays} days ago ` +
+              `and still in use. Rotating every ${ACCESS_KEY_MAX_AGE_DAYS} days limits how long a ` +
+              `leaked key stays useful.`,
+            fixSteps: [
+              `Rotate it: create a new key, update wherever it's used, confirm nothing broke, then delete the old one.`,
+              `CLI: aws iam create-access-key --user-name ${username}`,
+            ],
+            estimatedFixMinutes: 15,
           });
         }
       }
@@ -138,12 +176,24 @@ async function checkIamUsers(client: IAMClient, region: string, findings: Findin
           resourceId: username,
           region,
           severity: 'MEDIUM',
-          title: `IAM user has no MFA: ${username}`,
+          title: `IAM user has no MFA device: ${username}`,
+          // Deliberately conditional. ListMFADevices tells us no device is
+          // registered; it says nothing about whether the user has a console
+          // password at all. A programmatic-only service account has no MFA
+          // device and cannot sign in with a password, so the old wording
+          // ("can sign in with just a password") was simply false for those
+          // users. Knowing which is which needs iam:GetLoginProfile or the
+          // credential report, neither of which the audit role currently
+          // grants — so the finding states what we can see and flags what we
+          // can't, rather than guessing.
           description:
-            `User "${username}" can sign in with just a password — no second factor required. ` +
-            `If the password is leaked or guessed, the account is compromised.`,
+            `User "${username}" has no MFA device registered. If this user can sign in to the ` +
+            `console, a leaked or guessed password is all an attacker needs. Our read-only access ` +
+            `can't see whether a console password is set, so if this is a service account used ` +
+            `only for API calls, there may be nothing to fix here.`,
           fixSteps: [
-            `IAM → Users → ${username} → Security credentials → Assign MFA device.`,
+            `Check first whether this user has console access: IAM → Users → ${username} → Security credentials → "Console sign-in". If there's no password, no MFA is needed.`,
+            `If they do sign in: same page → Assign MFA device.`,
             `A virtual MFA app (Google Authenticator, Authy) takes about 2 minutes to set up.`,
           ],
           estimatedFixMinutes: 5,

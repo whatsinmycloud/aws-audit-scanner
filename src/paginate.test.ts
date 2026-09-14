@@ -81,8 +81,9 @@ describe('collectPages', () => {
 });
 
 describe('markerToken', () => {
-  // IAM and RDS can return a Marker on the final page. Following it costs an
-  // extra call at best, and re-reads page one at worst.
+  // The documented contract is that Marker is meaningful when IsTruncated is
+  // true. Branching on the flag follows it; branching on the Marker's presence
+  // assumes something the docs don't promise in either direction.
   it('only follows the Marker when IsTruncated says there is more', () => {
     expect(markerToken({ IsTruncated: true, Marker: 'next' })).toBe('next');
     expect(markerToken({ IsTruncated: false, Marker: 'stale' })).toBeUndefined();

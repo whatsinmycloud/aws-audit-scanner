@@ -62,7 +62,7 @@ describe('scanIam', () => {
     expect(titles).toContain('MFA');
   });
 
-  it('flags a stale-but-used access key as MEDIUM', async () => {
+  it('reports an idle key as idle, not as unrotated', async () => {
     iamMock.on(GetAccountSummaryCommand).resolves(HEALTHY_SUMMARY);
     iamMock.on(ListUsersCommand).resolves({ Users: [{ UserName: 'stephen', Path: '/', UserId: 'u1', Arn: 'arn:u1', CreateDate: daysAgo(400) }] });
     iamMock.on(ListAccessKeysCommand).resolves({
@@ -80,7 +80,50 @@ describe('scanIam', () => {
       severity: 'MEDIUM',
       resourceId: 'stephen/AKIASTALE',
     });
-    expect(result.findings[0]?.title).toContain('not rotated in 120 days');
+    // Was titled "not rotated in 120 days", where 120 was days since last use.
+    // Inactivity and rotation age are different questions and the title now
+    // says which one this is.
+    expect(result.findings[0]?.title).toContain('unused for 120 days');
+    expect(result.findings[0]?.title).not.toContain('rotated');
+  });
+
+  it('flags a key that is old but still in active use', async () => {
+    // The case the old code missed completely: age was measured from
+    // LastUsedDate, so a key created three years ago and used yesterday
+    // looked one day old and produced no finding at all.
+    iamMock.on(GetAccountSummaryCommand).resolves(HEALTHY_SUMMARY);
+    iamMock.on(ListUsersCommand).resolves({ Users: [{ UserName: 'stephen', Path: '/', UserId: 'u1', Arn: 'arn:u1', CreateDate: daysAgo(1200) }] });
+    iamMock.on(ListAccessKeysCommand).resolves({
+      AccessKeyMetadata: [{ AccessKeyId: 'AKIAOLDACTIVE', Status: 'Active', CreateDate: daysAgo(1100) }],
+    });
+    iamMock.on(GetAccessKeyLastUsedCommand).resolves(lastUsed(daysAgo(1)));
+    iamMock.on(ListMFADevicesCommand).resolves(MFA_DEVICE);
+
+    const result = await scanIam({ region: 'eu-west-1' });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.title).toContain('1100 days old');
+  });
+
+  it('never claims a user without MFA can sign in with a password', async () => {
+    // ListMFADevices says no device is registered. It says nothing about
+    // whether the user has a console password, so a programmatic-only service
+    // account must not be described as able to sign in.
+    iamMock.on(GetAccountSummaryCommand).resolves(HEALTHY_SUMMARY);
+    iamMock.on(ListUsersCommand).resolves({ Users: [{ UserName: 'ci-deploy', Path: '/', UserId: 'u2', Arn: 'arn:u2', CreateDate: daysAgo(30) }] });
+    iamMock.on(ListAccessKeysCommand).resolves({ AccessKeyMetadata: [] });
+    iamMock.on(ListMFADevicesCommand).resolves({ MFADevices: [] });
+
+    const result = await scanIam({ region: 'eu-west-1' });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const mfa = result.findings.find((f) => f.title.includes('no MFA device'));
+    expect(mfa).toBeDefined();
+    expect(mfa?.description).not.toContain('can sign in with just a password');
+    expect(mfa?.description).toContain('If this user can sign in');
   });
 
   it('flags an old never-used access key as HIGH', async () => {
