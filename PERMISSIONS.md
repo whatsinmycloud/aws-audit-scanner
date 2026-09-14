@@ -29,6 +29,13 @@ There are no write, create, modify, or delete permissions of any kind.
 | `ec2:DescribeInstances` | Your EC2 instances (type, state, launch time) |
 | `ec2:DescribeVolumes` | Your EBS volumes (size, attachment state) |
 | `ec2:DescribeSecurityGroups` | Firewall rules — to flag ports open to the whole internet |
+| `ec2:DescribeRegions` | Which regions are enabled, so the scan covers all of them rather than guessing |
+
+### RDS — spot forgotten databases in regions you've stopped using
+
+| Permission | What it lets us see |
+|---|---|
+| `rds:DescribeDBInstances` | Whether a region has database instances, so an idle region isn't reported as empty |
 
 ### S3 — find publicly exposed buckets
 
@@ -51,6 +58,9 @@ We **cannot** read any object in any bucket. There is no `s3:GetObject` here.
 | `iam:GetAccessKeyLastUsed` | When each key was last used |
 | `iam:ListMFADevices` | Whether users have MFA enabled |
 | `iam:GetAccountSummary` | Account-level counts (e.g. root MFA status) |
+| `iam:GetLoginProfile` | Whether a user has a console password, so a service account isn't flagged for missing console MFA. Returns metadata only, never the password. Scoped to users in your own account. |
+
+| `iam:ListRoleTags` | The version tag on the audit role this stack creates, and no other role — so we can tell you if your integration is out of date |
 
 We **cannot** see passwords, secret keys, or create/modify any user or policy.
 

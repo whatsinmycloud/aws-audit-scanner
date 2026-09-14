@@ -15,6 +15,7 @@ import {
   ListUsersCommand,
   ListAccessKeysCommand,
   ListMFADevicesCommand,
+  GetLoginProfileCommand,
 } from '@aws-sdk/client-iam';
 import { scanStoppedEc2 } from './scan-ec2.js';
 import { scanUnattachedEbs } from './scan-ebs.js';
@@ -161,12 +162,13 @@ describe('an account far bigger than one page', () => {
     iamMock.on(ListAccessKeysCommand).resolves({ AccessKeyMetadata: [] });
     // Nobody has MFA, so every user should produce a finding.
     iamMock.on(ListMFADevicesCommand).resolves({ MFADevices: [] });
+    iamMock.on(GetLoginProfileCommand).resolves({});
 
     const result = await scanIam({ region: REGION });
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    const noMfa = result.findings.filter((f) => f.title.startsWith('IAM user has no MFA'));
+    const noMfa = result.findings.filter((f) => f.title.includes('no MFA device'));
     expect(noMfa).toHaveLength(150);
     expect(noMfa.some((f) => f.title.includes('user-149'))).toBe(true);
   });
@@ -192,11 +194,12 @@ describe('an account far bigger than one page', () => {
     });
     iamMock.on(ListAccessKeysCommand).resolves({ AccessKeyMetadata: [] });
     iamMock.on(ListMFADevicesCommand).resolves({ MFADevices: [] });
+    iamMock.on(GetLoginProfileCommand).resolves({});
 
     const result = await scanIam({ region: REGION });
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.findings.filter((f) => f.title.startsWith('IAM user has no MFA'))).toHaveLength(1);
+    expect(result.findings.filter((f) => f.title.includes('no MFA device'))).toHaveLength(1);
   });
 });

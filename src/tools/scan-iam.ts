@@ -5,6 +5,7 @@ import {
   ListAccessKeysCommand,
   GetAccessKeyLastUsedCommand,
   ListMFADevicesCommand,
+  GetLoginProfileCommand,
 } from '@aws-sdk/client-iam';
 import type { Finding, ScanInput, ScanResult } from '../types.js';
 import { collectPages, markerToken } from '../paginate.js';
@@ -85,10 +86,29 @@ async function checkRootAccount(client: IAMClient, region: string, findings: Fin
   }
 }
 
+type ConsoleAccess = 'yes' | 'no' | 'unknown';
+
+// Whether this user can sign in to the console at all. GetLoginProfile returns
+// a profile when a console password is set and NoSuchEntity when it isn't, so
+// read-only access CAN answer this — but only if the audit role grants
+// iam:GetLoginProfile. Roles deployed before that permission existed will deny
+// the call, and a denial must not be read as either answer.
+async function consoleAccessFor(client: IAMClient, username: string): Promise<ConsoleAccess> {
+  try {
+    await client.send(new GetLoginProfileCommand({ UserName: username }));
+    return 'yes';
+  } catch (err) {
+    if (err instanceof Error && err.name.startsWith('NoSuchEntity')) return 'no';
+    return 'unknown';
+  }
+}
+
 async function checkIamUsers(client: IAMClient, region: string, findings: Finding[]) {
-  // ListUsers caps at 100 per page. Before this paginated, an account with
-  // more than 100 users had the rest silently skipped, and the MFA finding
-  // was reported as if it covered everyone.
+  // With MaxItems omitted, ListUsers defaults to at most 100 users per
+  // response, and the docs warn it may return fewer even when more exist — so
+  // the count is never an end-of-list signal, only IsTruncated is. Before this
+  // paginated, an account with more than 100 users had the rest silently
+  // skipped while the MFA finding read as if it covered everyone.
   const users = await collectPages({
     fetchPage: (Marker) =>
       client.send(new ListUsersCommand({ ...(Marker !== undefined && { Marker }) })),
@@ -124,8 +144,9 @@ async function checkIamUsers(client: IAMClient, region: string, findings: Findin
             title: `IAM access key never used: ${username} (${keyId})`,
             description:
               `User "${username}" has an active access key (${keyId}), created ${ageDays} days ago, ` +
-              `that has never been used. Unused keys are a security risk: if leaked, they give ` +
-              `permanent access with no audit trail.`,
+              `that has never been used. An unused active key is a long-lived credential ` +
+              `serving no known workload: if it leaks, it stays usable until someone disables ` +
+              `or deletes it.`,
             fixSteps: [
               `Delete the key: IAM → Users → ${username} → Security credentials → delete ${keyId}.`,
               `CLI: aws iam delete-access-key --user-name ${username} --access-key-id ${keyId}`,
@@ -171,33 +192,43 @@ async function checkIamUsers(client: IAMClient, region: string, findings: Findin
       // Check for users without MFA
       const mfaResponse = await client.send(new ListMFADevicesCommand({ UserName: username }));
       if ((mfaResponse.MFADevices ?? []).length === 0) {
-        findings.push({
-          service: 'IAM',
-          resourceId: username,
-          region,
-          severity: 'MEDIUM',
-          title: `IAM user has no MFA device: ${username}`,
-          // Deliberately conditional. ListMFADevices tells us no device is
-          // registered; it says nothing about whether the user has a console
-          // password at all. A programmatic-only service account has no MFA
-          // device and cannot sign in with a password, so the old wording
-          // ("can sign in with just a password") was simply false for those
-          // users. Knowing which is which needs iam:GetLoginProfile or the
-          // credential report, neither of which the audit role currently
-          // grants — so the finding states what we can see and flags what we
-          // can't, rather than guessing.
-          description:
-            `User "${username}" has no MFA device registered. If this user can sign in to the ` +
-            `console, a leaked or guessed password is all an attacker needs. Our read-only access ` +
-            `can't see whether a console password is set, so if this is a service account used ` +
-            `only for API calls, there may be nothing to fix here.`,
-          fixSteps: [
-            `Check first whether this user has console access: IAM → Users → ${username} → Security credentials → "Console sign-in". If there's no password, no MFA is needed.`,
-            `If they do sign in: same page → Assign MFA device.`,
-            `A virtual MFA app (Google Authenticator, Authy) takes about 2 minutes to set up.`,
-          ],
-          estimatedFixMinutes: 5,
-        });
+        const consoleAccess = await consoleAccessFor(client, username);
+
+        // A user with no console password cannot sign in with one, so there is
+        // no console-MFA problem to report. Raising it anyway was a false
+        // positive on every programmatic-only service account.
+        if (consoleAccess !== 'no') {
+          const certain = consoleAccess === 'yes';
+          findings.push({
+            service: 'IAM',
+            resourceId: username,
+            region,
+            // Downgraded when we can't establish console access: an unverified
+            // finding should not sit at the same severity as a confirmed one.
+            severity: certain ? 'MEDIUM' : 'LOW',
+            title: certain
+              ? `IAM user has console access and no MFA device: ${username}`
+              : `IAM user has no MFA device, console access unknown: ${username}`,
+            description: certain
+              ? `User "${username}" can sign in to the console and has no MFA device registered. ` +
+                `A leaked or guessed password is all an attacker needs.`
+              : `User "${username}" has no MFA device registered. The scanner's current ` +
+                `permissions don't include iam:GetLoginProfile, so it can't tell whether a ` +
+                `console password is configured. If this is a service account used only for ` +
+                `API calls, there is nothing to fix here.`,
+            fixSteps: certain
+              ? [
+                  `IAM → Users → ${username} → Security credentials → Assign MFA device.`,
+                  `A virtual MFA app (Google Authenticator, Authy) takes about 2 minutes to set up.`,
+                ]
+              : [
+                  `Check console access first: IAM → Users → ${username} → Security credentials → "Console sign-in". If there is no console password, this finding does not apply; review the user's access keys separately.`,
+                  `If they do sign in: same page → Assign MFA device.`,
+                  `A virtual MFA app (Google Authenticator, Authy) takes about 2 minutes to set up.`,
+                ],
+            estimatedFixMinutes: 5,
+          });
+        }
       }
     })
   );

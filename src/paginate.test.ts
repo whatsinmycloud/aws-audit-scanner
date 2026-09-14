@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { collectPages, markerToken } from './paginate.js';
+import { collectPages, markerToken, PaginationError } from './paginate.js';
 
 type Page = { items?: string[]; next?: string };
 
@@ -44,29 +44,33 @@ describe('collectPages', () => {
     expect(items).toEqual([]);
   });
 
-  it('stops when an API echoes the same token back, instead of looping forever', async () => {
+  // Both of these used to return whatever had been collected so far, which is
+  // a partial list wearing the clothes of a complete one — the defect this
+  // module exists to prevent, reproduced inside it. They throw now.
+  it('throws rather than returning partial results when a token repeats', async () => {
     const fetchPage = vi.fn(async () => ({ items: ['x'], next: 'same' }) as Page);
-    const items = await collectPages<Page, string>({
-      fetchPage,
-      itemsOf: (p) => p.items,
-      tokenOf: (p) => p.next,
-    });
-    // Two calls: the first returns "same", the second is asked with it and
-    // returns it again, which is where the guard trips.
-    expect(fetchPage).toHaveBeenCalledTimes(2);
-    expect(items).toEqual(['x', 'x']);
+
+    await expect(
+      collectPages<Page, string>({
+        fetchPage,
+        itemsOf: (p) => p.items,
+        tokenOf: (p) => p.next,
+      })
+    ).rejects.toThrow(PaginationError);
   });
 
-  it('caps the number of pages so a never-ending token cannot hang a scan', async () => {
+  it('throws rather than returning partial results when the page cap is hit', async () => {
     let n = 0;
     const fetchPage = vi.fn(async () => ({ items: ['x'], next: `page-${n++}` }) as Page);
-    const items = await collectPages<Page, string>({
-      fetchPage,
-      itemsOf: (p) => p.items,
-      tokenOf: (p) => p.next,
-    });
+
+    await expect(
+      collectPages<Page, string>({
+        fetchPage,
+        itemsOf: (p) => p.items,
+        tokenOf: (p) => p.next,
+      })
+    ).rejects.toThrow(/refusing to return partial results/);
     expect(fetchPage).toHaveBeenCalledTimes(200);
-    expect(items).toHaveLength(200);
   });
 
   it('treats an empty-string token as the end', async () => {
@@ -89,5 +93,9 @@ describe('markerToken', () => {
     expect(markerToken({ IsTruncated: false, Marker: 'stale' })).toBeUndefined();
     expect(markerToken({ Marker: 'stale' })).toBeUndefined();
     expect(markerToken({})).toBeUndefined();
+  });
+
+  it('throws when a response says it is truncated but gives nowhere to continue', () => {
+    expect(() => markerToken({ IsTruncated: true })).toThrow(PaginationError);
   });
 });

@@ -14,6 +14,17 @@
 // loop that would otherwise run forever on a malformed or looping token.
 const MAX_PAGES = 200;
 
+// Thrown rather than returned, so a caller cannot mistake an incomplete list
+// for a complete one. Each scan tool already converts a thrown error into an
+// explicit unsuccessful result, so one bad paginated call degrades that check
+// instead of the whole scan.
+export class PaginationError extends Error {
+  constructor(reason: string) {
+    super(`Stopped paginating because ${reason}; refusing to return partial results`);
+    this.name = 'PaginationError';
+  }
+}
+
 export type PaginateOptions<TPage, TItem> = {
   // Fetch one page. Called with undefined first, then with each page's token.
   fetchPage: (token: string | undefined) => Promise<TPage>;
@@ -36,12 +47,20 @@ export async function collectPages<TPage, TItem>({
     collected.push(...(itemsOf(response) ?? []));
 
     const next = tokenOf(response);
-    // An API that echoes the same token back would otherwise loop forever.
-    if (next === undefined || next === '' || next === token) return collected;
+    if (next === undefined || next === '') return collected;
+
+    // Fail closed. Both of the cases below used to `return collected`, which
+    // handed back a partial list indistinguishable from a complete one — the
+    // exact defect this module was written to fix, reproduced inside the fix.
+    // A caller that gets an error knows it has nothing; a caller that gets 100
+    // of 150 users does not.
+    if (next === token) {
+      throw new PaginationError('the service repeated its continuation token');
+    }
     token = next;
   }
 
-  return collected;
+  throw new PaginationError(`more than ${MAX_PAGES} pages of results`);
 }
 
 // IAM and RDS signal "more pages" with IsTruncated alongside Marker, and the
@@ -57,5 +76,11 @@ export function markerToken(page: {
   IsTruncated?: boolean | undefined;
   Marker?: string | undefined;
 }): string | undefined {
-  return page.IsTruncated === true ? page.Marker : undefined;
+  if (page.IsTruncated !== true) return undefined;
+  // Truncated with nowhere to continue from. Returning undefined here would
+  // quietly treat a partial list as the whole thing.
+  if (!page.Marker) {
+    throw new PaginationError('the response was truncated but carried no continuation marker');
+  }
+  return page.Marker;
 }
